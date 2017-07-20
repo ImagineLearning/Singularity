@@ -73,9 +73,11 @@ public class SingularityConfiguration extends Configuration {
 
   private long checkUsageEveryMillis = TimeUnit.MINUTES.toMillis(1);
 
+  private int usageIntervalSeconds = 5760; // 15 saved each 5760 seconds (96 min) apart is 1 day of usage
+
   private long cleanUsageEveryMillis = TimeUnit.MINUTES.toMillis(5);
 
-  private int numUsageToKeep = 5;
+  private int numUsageToKeep = 15;
 
   private long cleanupEverySeconds = 5;
 
@@ -161,6 +163,8 @@ public class SingularityConfiguration extends Configuration {
   private Optional<Integer> healthcheckMaxRetries = Optional.absent();
 
   private Optional<Integer> healthcheckMaxTotalTimeoutSeconds = Optional.absent();
+
+  private long killTaskIfNotHealthyAfterSeconds = 600;
 
   @NotNull
   private List<Integer> healthcheckFailureStatusCodes = Collections.emptyList();
@@ -612,6 +616,10 @@ public class SingularityConfiguration extends Configuration {
     return healthcheckMaxTotalTimeoutSeconds;
   }
 
+  public long getKillTaskIfNotHealthyAfterSeconds() {
+    return killTaskIfNotHealthyAfterSeconds;
+  }
+
   public Optional<String> getHostname() {
     return Optional.fromNullable(Strings.emptyToNull(hostname));
   }
@@ -1004,6 +1012,11 @@ public class SingularityConfiguration extends Configuration {
 
   public void setHealthcheckMaxTotalTimeoutSeconds(Optional<Integer> healthcheckMaxTotalTimeoutSeconds) {
     this.healthcheckMaxTotalTimeoutSeconds = healthcheckMaxTotalTimeoutSeconds;
+  }
+
+  public SingularityConfiguration setKillTaskIfNotHealthyAfterSeconds(long killTaskIfNotHealthyAfterSeconds) {
+    this.killTaskIfNotHealthyAfterSeconds = killTaskIfNotHealthyAfterSeconds;
+    return this;
   }
 
   public List<Integer> getHealthcheckFailureStatusCodes() {
@@ -1406,6 +1419,15 @@ public class SingularityConfiguration extends Configuration {
 
   public void setCheckUsageEveryMillis(long checkUsageEveryMillis) {
     this.checkUsageEveryMillis = checkUsageEveryMillis;
+  }
+
+  public int getUsageIntervalSeconds() {
+    return usageIntervalSeconds;
+  }
+
+  public SingularityConfiguration setUsageIntervalSeconds(int usageIntervalSeconds) {
+    this.usageIntervalSeconds = usageIntervalSeconds;
+    return this;
   }
 
   public long getCleanUsageEveryMillis() {
