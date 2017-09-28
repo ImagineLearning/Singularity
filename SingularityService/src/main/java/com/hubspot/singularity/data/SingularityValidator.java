@@ -4,6 +4,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import static com.hubspot.singularity.WebExceptions.badRequest;
 import static com.hubspot.singularity.WebExceptions.checkBadRequest;
 import static com.hubspot.singularity.WebExceptions.checkConflict;
+import static com.hubspot.singularity.WebExceptions.checkRateLimited;
 
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -43,20 +44,26 @@ import com.hubspot.mesos.SingularityMesosTaskLabel;
 import com.hubspot.mesos.SingularityPortMappingType;
 import com.hubspot.mesos.SingularityVolume;
 import com.hubspot.singularity.MachineState;
+import com.hubspot.singularity.RequestType;
 import com.hubspot.singularity.ScheduleType;
 import com.hubspot.singularity.SingularityAction;
 import com.hubspot.singularity.SingularityDeploy;
 import com.hubspot.singularity.SingularityDeployBuilder;
+import com.hubspot.singularity.SingularityPendingRequest;
+import com.hubspot.singularity.SingularityPendingRequest.PendingType;
+import com.hubspot.singularity.SingularityPendingTaskId;
 import com.hubspot.singularity.SingularityPriorityFreezeParent;
 import com.hubspot.singularity.SingularityRequest;
 import com.hubspot.singularity.SingularityRequestGroup;
 import com.hubspot.singularity.SingularityShellCommand;
+import com.hubspot.singularity.SingularityTaskId;
 import com.hubspot.singularity.SingularityWebhook;
 import com.hubspot.singularity.SlavePlacement;
 import com.hubspot.singularity.WebExceptions;
 import com.hubspot.singularity.api.SingularityBounceRequest;
 import com.hubspot.singularity.api.SingularityMachineChangeRequest;
 import com.hubspot.singularity.api.SingularityPriorityFreeze;
+import com.hubspot.singularity.api.SingularityRunNowRequest;
 import com.hubspot.singularity.config.SingularityConfiguration;
 import com.hubspot.singularity.config.UIConfiguration;
 import com.hubspot.singularity.config.shell.ShellCommandDescriptor;
@@ -67,7 +74,7 @@ import com.hubspot.singularity.expiring.SingularityExpiringMachineState;
 @Singleton
 public class SingularityValidator {
   private static final Joiner JOINER = Joiner.on(" ");
-  private static final Pattern DEPLOY_ID_ILLEGAL_PATTERN = Pattern.compile("[^a-zA-Z0-9_]");
+  private static final Pattern DEPLOY_ID_ILLEGAL_PATTERN = Pattern.compile("[^a-zA-Z0-9_.]");
   private static final Pattern REQUEST_ID_ILLEGAL_PATTERN = Pattern.compile("[^a-zA-Z0-9_-]");
   private static final Pattern DAY_RANGE_REGEXP = Pattern.compile("[0-7]-[0-7]");
   private static final Pattern COMMA_DAYS_REGEXP = Pattern.compile("([0-7],)+([0-7])?");
@@ -83,11 +90,12 @@ public class SingularityValidator {
   private final int maxMemoryMbPerRequest;
   private final int maxMemoryMbPerInstance;
   private final Optional<Integer> maxTotalHealthcheckTimeoutSeconds;
-  private final long defaultKillAfterNotHealthySeconds;
+  private final long defaultKillHealthcheckAfterSeconds;
   private final int defaultHealthcheckIntervalSeconds;
-  private final int defaultHealthcheckStartupTimeooutSeconds;
+  private final int defaultHealthcheckStartupTimeoutSeconds;
   private final int defaultHealthcehckMaxRetries;
   private final int defaultHealthcheckResponseTimeoutSeconds;
+  private final int maxRunNowTaskLaunchDelay;
   private final int maxDecommissioningSlaves;
   private final boolean spreadAllSlavesEnabled;
   private final boolean allowRequestsWithoutOwners;
@@ -130,11 +138,12 @@ public class SingularityValidator {
     this.allowBounceToSameHost = configuration.isAllowBounceToSameHost();
 
     this.maxTotalHealthcheckTimeoutSeconds = configuration.getHealthcheckMaxTotalTimeoutSeconds();
-    this.defaultKillAfterNotHealthySeconds = configuration.getKillAfterTasksDoNotRunDefaultSeconds();
+    this.defaultKillHealthcheckAfterSeconds = configuration.getKillTaskIfNotHealthyAfterSeconds();
     this.defaultHealthcheckIntervalSeconds = configuration.getHealthcheckIntervalSeconds();
-    this.defaultHealthcheckStartupTimeooutSeconds = configuration.getStartupTimeoutSeconds();
+    this.defaultHealthcheckStartupTimeoutSeconds = configuration.getStartupTimeoutSeconds();
     this.defaultHealthcehckMaxRetries = configuration.getHealthcheckMaxRetries().or(0);
     this.defaultHealthcheckResponseTimeoutSeconds = configuration.getHealthcheckTimeoutSeconds();
+    this.maxRunNowTaskLaunchDelay = configuration.getMaxRunNowTaskLaunchDelayDays();
 
     this.maxDecommissioningSlaves = configuration.getMaxDecommissioningSlaves();
     this.spreadAllSlavesEnabled = configuration.isSpreadAllSlavesEnabled();
@@ -248,7 +257,10 @@ public class SingularityValidator {
     return webhook;
   }
 
-  public SingularityDeploy checkDeploy(SingularityRequest request, SingularityDeploy deploy) {
+  public SingularityDeploy checkDeploy(SingularityRequest request,
+                                       SingularityDeploy deploy,
+                                       List<SingularityTaskId> activeTasks,
+                                       List<SingularityPendingTaskId> pendingTasks) {
     checkNotNull(request, "request is null");
     checkNotNull(deploy, "deploy is null");
 
@@ -262,7 +274,7 @@ public class SingularityValidator {
       deployId = deploy.getId();
     }
 
-    checkBadRequest(deployId != null && ! DEPLOY_ID_ILLEGAL_PATTERN.matcher(deployId).find(), "Id cannot be null or contain characters other than [a-zA-Z0-9_]");
+    checkBadRequest(deployId != null && ! DEPLOY_ID_ILLEGAL_PATTERN.matcher(deployId).find(), "Id cannot be null or contain characters other than [a-zA-Z0-9_.]");
     checkBadRequest(deployId.length() <= maxDeployIdSize, "Deploy id must be %s characters or less, it is %s (%s)", maxDeployIdSize, deployId.length(), deployId);
     checkBadRequest(deploy.getRequestId() != null && deploy.getRequestId().equals(request.getId()), "Deploy id must match request id");
 
@@ -304,18 +316,19 @@ public class SingularityValidator {
       HealthcheckOptions options = deploy.getHealthcheck().get();
       int intervalSeconds = options.getIntervalSeconds().or(defaultHealthcheckIntervalSeconds);
       int httpTimeoutSeconds = options.getResponseTimeoutSeconds().or(defaultHealthcheckResponseTimeoutSeconds);
-      int startupTime = options.getStartupTimeoutSeconds().or(defaultHealthcheckStartupTimeooutSeconds);
+      int startupTime = options.getStartupTimeoutSeconds().or(defaultHealthcheckStartupTimeoutSeconds);
       int attempts = options.getMaxRetries().or(defaultHealthcehckMaxRetries) + 1;
 
-      checkBadRequest((startupTime + ((httpTimeoutSeconds + intervalSeconds) * attempts)) > maxTotalHealthcheckTimeoutSeconds.get(),
+      int totalHealthCheckTime = startupTime + ((httpTimeoutSeconds + intervalSeconds) * attempts);
+      checkBadRequest(totalHealthCheckTime < maxTotalHealthcheckTimeoutSeconds.get(),
         String.format("Max healthcheck time cannot be greater than %s, (was startup timeout: %s, interval: %s, attempts: %s)", maxTotalHealthcheckTimeoutSeconds.get(), startupTime, intervalSeconds, attempts));
     }
 
     if (deploy.getHealthcheck().isPresent() && deploy.getHealthcheck().get().getStartupDelaySeconds().isPresent()) {
       int startUpDelay = deploy.getHealthcheck().get().getStartupDelaySeconds().get();
 
-      checkBadRequest(startUpDelay < defaultKillAfterNotHealthySeconds,
-          String.format("Health check startup delay time must be less than %s (was %s)", defaultKillAfterNotHealthySeconds, startUpDelay));
+      checkBadRequest(startUpDelay < defaultKillHealthcheckAfterSeconds,
+          String.format("Health check startup delay time must be less than max health check run time %s (was %s)", defaultKillHealthcheckAfterSeconds, startUpDelay));
     }
 
     checkBadRequest(deploy.getCommand().isPresent() && !deploy.getExecutorData().isPresent() ||
@@ -355,11 +368,109 @@ public class SingularityValidator {
 
     checkBadRequest(deployHistoryHelper.isDeployIdAvailable(request.getId(), deployId), "Can not deploy a deploy that has already been deployed");
 
+    if (deploy.getRunImmediately().isPresent()) {
+      deploy = checkImmediateRunDeploy(request, deploy, deploy.getRunImmediately().get(), activeTasks, pendingTasks);
+    }
+
     if (request.isDeployable()) {
       checkRequestForPriorityFreeze(request);
     }
 
     return deploy;
+  }
+
+  private SingularityDeploy checkImmediateRunDeploy(SingularityRequest request,
+                                                    SingularityDeploy deploy,
+                                                    SingularityRunNowRequest runNowRequest,
+                                                    List<SingularityTaskId> activeTasks,
+                                                    List<SingularityPendingTaskId> pendingTasks) {
+    if (!request.isScheduled() && !request.isOneOff()) {
+      throw badRequest("Can not request an immediate run of a non-scheduled / always running request (%s)", request);
+    }
+
+    return deploy.toBuilder()
+        .setRunImmediately(Optional.of(fillRunNowRequest(Optional.of(runNowRequest))))
+        .build();
+  }
+
+  public SingularityPendingRequest checkRunNowRequest(String deployId,
+                                                      Optional<String> userEmail,
+                                                      SingularityRequest request,
+                                                      Optional<SingularityRunNowRequest> maybeRunNowRequest,
+                                                      List<SingularityTaskId> activeTasks,
+                                                      List<SingularityPendingTaskId> pendingTasks) {
+    SingularityRunNowRequest runNowRequest = fillRunNowRequest(maybeRunNowRequest);
+    PendingType pendingType;
+    if (request.isScheduled()) {
+      pendingType = PendingType.IMMEDIATE;
+      checkConflict(activeTasks.isEmpty(), "Cannot request immediate run of a scheduled job which is currently running (%s)", activeTasks);
+    } else if (request.isOneOff()) {
+      pendingType = PendingType.ONEOFF;
+      if (request.getInstances().isPresent()) {
+        checkRateLimited(
+            activeTasks.size() + pendingTasks.size() < request.getInstances().get(),
+            "No more than %s tasks allowed to run concurrently for request %s (%s active, %s pending)",
+            request.getInstances().get(), request, activeTasks.size(), pendingTasks.size());
+      }
+    } else {
+      throw badRequest("Can not request an immediate run of a non-scheduled / always running request (%s)", request);
+    }
+
+    if (runNowRequest.getRunAt().isPresent()
+        && runNowRequest.getRunAt().get() > (System.currentTimeMillis() + TimeUnit.DAYS.toMillis(maxRunNowTaskLaunchDelay))) {
+      throw badRequest("Task launch delay can be at most %d days from now.", maxRunNowTaskLaunchDelay);
+    }
+
+
+
+    return new SingularityPendingRequest(
+        request.getId(),
+        deployId,
+        System.currentTimeMillis(),
+        userEmail,
+        pendingType,
+        runNowRequest.getCommandLineArgs(),
+        Optional.of(getRunId(runNowRequest.getRunId())),
+        runNowRequest.getSkipHealthchecks(),
+        runNowRequest.getMessage(),
+        Optional.absent(),
+        runNowRequest.getResources(),
+        runNowRequest.getRunAt()
+    );
+  }
+
+  private SingularityRunNowRequest fillRunNowRequest(Optional<SingularityRunNowRequest> maybeRequest) {
+    if (maybeRequest.isPresent()) {
+      SingularityRunNowRequest request = maybeRequest.get();
+      return new SingularityRunNowRequest(
+          request.getMessage(),
+          request.getSkipHealthchecks(),
+          Optional.of(getRunId(request.getRunId())),
+          request.getCommandLineArgs(),
+          request.getResources(),
+          request.getRunAt());
+    } else {
+      return new SingularityRunNowRequest(
+          Optional.absent(),
+          Optional.absent(),
+          Optional.of(getRunId(Optional.absent())),
+          Optional.absent(),
+          Optional.absent(),
+          Optional.absent());
+    }
+  }
+
+  private String getRunId(Optional<String> maybeRunId) {
+    if (maybeRunId.isPresent()) {
+      String runId = maybeRunId.get();
+      if (runId.length() > 100) {
+        throw badRequest("RunId must be less than 100 characters. RunId %s has %s characters", runId, runId.length());
+      } else {
+        return runId;
+      }
+    } else {
+      return UUID.randomUUID().toString();
+    }
   }
 
   /**
@@ -385,7 +496,7 @@ public class SingularityValidator {
 
     String[] split = schedule.split(" ");
 
-    checkBadRequest(split.length >= 4, "Schedule %s is invalid because it contained only %s splits (looking for at least 4)", schedule, split.length);
+    checkBadRequest(split.length >= 5, "Schedule %s is invalid because it contained only %s splits (looking for at least 5)", schedule, split.length);
 
     List<String> newSchedule = Lists.newArrayListWithCapacity(6);
 
@@ -438,7 +549,11 @@ public class SingularityValidator {
   }
 
   private void checkForIllegalChanges(SingularityRequest request, SingularityRequest existingRequest) {
-    checkBadRequest(request.getRequestType() == existingRequest.getRequestType(), String.format("Request can not change requestType from %s to %s", existingRequest.getRequestType(), request.getRequestType()));
+    if (request.getRequestType() != existingRequest.getRequestType()) {
+      boolean validWorkerServiceTransition = (existingRequest.getRequestType() == RequestType.SERVICE && !existingRequest.isLoadBalanced() && request.getRequestType() == RequestType.WORKER) ||
+          (request.getRequestType() == RequestType.SERVICE && !request.isLoadBalanced() && existingRequest.getRequestType() == RequestType.WORKER);
+      checkBadRequest(validWorkerServiceTransition, String.format("Request can not change requestType from %s to %s", existingRequest.getRequestType(), request.getRequestType()));
+    }
     checkBadRequest(request.isLoadBalanced() == existingRequest.isLoadBalanced(), "Request can not change whether it is load balanced");
   }
 
