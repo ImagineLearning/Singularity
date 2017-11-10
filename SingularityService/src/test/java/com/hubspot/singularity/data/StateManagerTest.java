@@ -1,6 +1,6 @@
 package com.hubspot.singularity.data;
 
-import org.apache.mesos.Protos.TaskState;
+import org.apache.mesos.v1.Protos.TaskState;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -28,7 +28,7 @@ public class StateManagerTest extends SingularitySchedulerTestBase{
     initRequest();
     initFirstDeploy();
 
-    SingularityRequest request = requestResource.getRequest(requestId).getRequest();
+    SingularityRequest request = requestResource.getRequest(requestId, singularityUser).getRequest();
     saveAndSchedule(request.toBuilder().setInstances(Optional.of(3)));
     resourceOffers();
 

@@ -16,8 +16,8 @@ import java.util.stream.Collectors;
 
 import javax.inject.Singleton;
 
-import org.apache.mesos.Protos;
-import org.apache.mesos.Protos.TaskStatus.Reason;
+import org.apache.mesos.v1.Protos;
+import org.apache.mesos.v1.Protos.TaskStatus.Reason;
 import org.dmfs.rfc5545.recur.InvalidRecurrenceRuleException;
 import org.quartz.CronExpression;
 import org.slf4j.Logger;
@@ -463,11 +463,17 @@ public class SingularityScheduler {
       }
 
       List<SingularityTaskId> remainingActiveTasks = new ArrayList<>(matchingTaskIds);
-      for (int i = 0; i < Math.abs(numMissingInstances); i++) {
-        final SingularityTaskId toCleanup = matchingTaskIds.get(i);
-        remainingActiveTasks.remove(toCleanup);
-        LOG.info("Cleaning up task {} due to new request {} - scaling down to {} instances", toCleanup.getId(), request.getId(), request.getInstancesSafe());
-        taskManager.createTaskCleanup(new SingularityTaskCleanup(pendingRequest.getUser(), TaskCleanupType.SCALING_DOWN, now, toCleanup, Optional.<String>absent(), Optional.<String>absent(), Optional.<SingularityTaskShellCommandRequestId>absent()));
+      final int expectedInstances = numMissingInstances + matchingTaskIds.size();
+      LOG.info("expected {} active {}", expectedInstances, matchingTaskIds);
+
+      List<Integer> usedIds = new ArrayList<>();
+      for (SingularityTaskId taskId : matchingTaskIds) {
+        if (usedIds.contains(taskId.getInstanceNo()) || taskId.getInstanceNo() > expectedInstances) {
+          remainingActiveTasks.remove(taskId);
+          LOG.info("Cleaning up task {} due to new request {} - scaling down to {} instances", taskId.getId(), request.getId(), request.getInstancesSafe());
+          taskManager.createTaskCleanup(new SingularityTaskCleanup(pendingRequest.getUser(), TaskCleanupType.SCALING_DOWN, now, taskId, Optional.absent(), Optional.absent(), Optional.absent()));
+        }
+        usedIds.add(taskId.getInstanceNo());
       }
 
       if (request.isRackSensitive() && configuration.isRebalanceRacksOnScaleDown()) {
